@@ -1,0 +1,3 @@
+# Run from the repository root: python -m unittest discover -s tests -v
+-r requirements.txt
+httpx==0.28.1

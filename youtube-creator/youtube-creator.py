@@ -2,12 +2,13 @@
 """
 YouTube Creator Agent - 自动创作视频并发布到 YouTube
 
-工具: bash, read_file, write_file, generate_assets, compose_video, upload_youtube
+工具: read_file, write_file, generate_assets, compose_video, upload_youtube
 """
 
 import os
 import subprocess
 import json
+import sys
 from pathlib import Path
 
 try:
@@ -38,7 +39,10 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ.get("MODEL_ID", "claude-opus-4-5")
 WORKDIR = Path.cwd()
 OUTPUT_DIR = WORKDIR / "output"
+if OUTPUT_DIR.is_symlink() or (OUTPUT_DIR.exists() and not OUTPUT_DIR.is_dir()):
+    raise RuntimeError("Unsafe output directory")
 OUTPUT_DIR.mkdir(exist_ok=True)
+MAX_TEXT_BYTES = 100_000
 
 SYSTEM = f"""你是一个专业的 YouTube 视频创作 agent，工作目录: {WORKDIR}
 
@@ -74,15 +78,6 @@ SYSTEM = f"""你是一个专业的 YouTube 视频创作 agent，工作目录: {W
 """
 
 TOOLS = [
-    {
-        "name": "bash",
-        "description": "执行 shell 命令。用于 ffmpeg、文件操作等。",
-        "input_schema": {
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-    },
     {
         "name": "read_file",
         "description": "读取文件内容",
@@ -151,39 +146,52 @@ TOOLS = [
 
 
 def run_bash(command: str) -> str:
-    # NOTE: this is a best-effort denylist, NOT a security sandbox. The bash
-    # tool executes commands proposed by an AI model with shell=True; treat all
-    # input as untrusted and do not run this agent on machines holding secrets.
-    # ffmpeg / ffprobe / edge-tts are intentionally allowed (the video pipeline
-    # needs them), so only clearly destructive / exfiltration patterns are blocked.
-    dangerous = [
-        "rm -rf /", "rm -rf ~", "rm -rf *", "rm -rf .",
-        "sudo ", "shutdown", "reboot", "halt", "mkfs",
-        "> /dev/", "dd if=", ":(){", "chmod -r 777 /",
-        "/etc/passwd", "/etc/shadow", "~/.ssh", "history -c",
-    ]
-    lowered = command.lower()
-    if any(d in lowered for d in dangerous):
-        return "Error: 危险命令已阻止"
+    """Compatibility stub for old tool calls; never execute model commands."""
+    return "Error: shell tool is disabled"
+
+
+def _output_path(path: str) -> Path:
+    candidate = WORKDIR / path
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=300)
-        out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: 命令超时 (300s)"
+        relative = candidate.relative_to(OUTPUT_DIR)
+    except ValueError:
+        raise ValueError("Files must be inside output/") from None
+    if not relative.parts:
+        raise ValueError("A filename is required")
+    current = OUTPUT_DIR
+    for part in relative.parts:
+        lower = part.lower()
+        if (part.startswith('.') or lower.startswith(('credentials.', 'secrets.', 'id_rsa'))
+                or lower in {'auth.json', 'youtube_token.json', 'youtube_credentials.json'}
+                or lower.endswith(('.key', '.pem'))):
+            raise ValueError("Hidden, parent, and credential paths are not allowed")
+        current = current / part
+        if current.is_symlink() or (current.exists() and current.stat().st_nlink > 1
+                                    and not current.is_dir()):
+            raise ValueError("Linked files are not allowed")
+        if current.exists() and not (current.is_dir() or current.is_file()):
+            raise ValueError("Only regular files and directories are allowed")
+    if OUTPUT_DIR.is_symlink():
+        raise ValueError("Linked output directory is not allowed")
+    return candidate
 
 
 def run_read_file(path: str) -> str:
     try:
-        return (WORKDIR / path).read_text()[:50000]
+        with _output_path(path).open('rb') as stream:
+            data = stream.read(MAX_TEXT_BYTES + 1)
+        if len(data) > MAX_TEXT_BYTES:
+            return "Error: text file is too large"
+        return data.decode('utf-8')
     except Exception as e:
         return f"Error: {e}"
 
 
 def run_write_file(path: str, content: str) -> str:
     try:
-        p = WORKDIR / path
+        if len(content.encode('utf-8')) > MAX_TEXT_BYTES:
+            return "Error: text file is too large"
+        p = _output_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         return f"已写入 {len(content)} 字节到 {path}"
@@ -201,13 +209,15 @@ def format_srt_time(seconds: float) -> str:
 
 def run_generate_assets(script_path: str) -> str:
     try:
-        script = json.loads((WORKDIR / script_path).read_text())
+        script = json.loads(run_read_file(script_path))
     except Exception as e:
         return f"Error: 读取脚本失败 - {e}"
 
-    segments = script.get("segments", [])
-    if not segments:
+    segments = script.get("segments", []) if isinstance(script, dict) else []
+    if not isinstance(segments, list) or not segments or len(segments) > 100:
         return "Error: 脚本中没有 segments"
+    if any(not isinstance(seg, dict) or not isinstance(seg.get('text'), str) for seg in segments):
+        return "Error: segments must contain text strings"
 
     lang = script.get("language", "zh-CN")
     voice_map = {
@@ -218,28 +228,30 @@ def run_generate_assets(script_path: str) -> str:
     }
     voice = voice_map.get(lang, "zh-CN-YunxiNeural")
 
-    audio_dir = OUTPUT_DIR / "audio"
+    audio_dir = _output_path("output/audio")
     audio_dir.mkdir(exist_ok=True)
 
-    check = subprocess.run("edge-tts --version", shell=True, capture_output=True, text=True)
+    check = subprocess.run(["edge-tts", "--version"], capture_output=True, text=True, timeout=15)
     if check.returncode != 0:
         return "Error: edge-tts 未安装。请运行: pip install edge-tts"
 
     results = []
     srt_lines = []
     time_offset = 0.0
+    files = []
 
     for i, seg in enumerate(segments):
         text = seg["text"]
-        audio_file = audio_dir / f"seg_{i:03d}.mp3"
-        cmd = f'edge-tts --voice "{voice}" --text "{text}" --write-media "{audio_file}"'
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+        audio_file = _output_path(f"output/audio/seg_{i:03d}.mp3")
+        cmd = ['edge-tts', '--voice', voice, '--text', text, '--write-media', str(audio_file)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             results.append(f"  段落 {i}: TTS 失败 - {r.stderr[:100]}")
-            continue
+            return "Error: TTS failed; assets are incomplete"
+        files.append(audio_file)
 
-        dur_cmd = f'ffprobe -v error -show_entries format=duration -of csv=p=0 "{audio_file}"'
-        dur_r = subprocess.run(dur_cmd, shell=True, capture_output=True, text=True)
+        dur_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(audio_file)]
+        dur_r = subprocess.run(dur_cmd, capture_output=True, text=True, timeout=30)
         try:
             duration = float(dur_r.stdout.strip())
         except ValueError:
@@ -251,18 +263,19 @@ def run_generate_assets(script_path: str) -> str:
         time_offset += duration
         results.append(f"  段落 {i}: {duration:.1f}s ✓")
 
-    srt_path = OUTPUT_DIR / "subtitles.srt"
+    srt_path = _output_path("output/subtitles.srt")
     srt_path.write_text("\n".join(srt_lines))
 
-    if list(audio_dir.glob("seg_*.mp3")):
-        file_list = OUTPUT_DIR / "audio_list.txt"
-        files = sorted(audio_dir.glob("seg_*.mp3"))
-        file_list.write_text("\n".join(f"file '{f}'" for f in files))
-        merge_cmd = f'ffmpeg -y -f concat -safe 0 -i "{file_list}" -c copy "{OUTPUT_DIR}/narration.mp3"'
-        subprocess.run(merge_cmd, shell=True, capture_output=True, timeout=120)
+    if files:
+        file_list = _output_path("output/audio_list.txt")
+        file_list.write_text("\n".join(f"file 'audio/{f.name}'" for f in files))
+        narration = _output_path("output/narration.mp3")
+        merge_cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '1', '-i', str(file_list), '-c', 'copy', str(narration)]
+        subprocess.run(merge_cmd, check=True, capture_output=True, timeout=120)
 
-    bg_cmd = f'ffmpeg -y -f lavfi -i color=c=0x1a1a2e:s=1920x1080:d=1 -frames:v 1 "{OUTPUT_DIR}/background.png"'
-    subprocess.run(bg_cmd, shell=True, capture_output=True, timeout=30)
+    background = _output_path("output/background.png")
+    bg_cmd = ['ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=c=0x1a1a2e:s=1920x1080:d=1', '-frames:v', '1', str(background)]
+    subprocess.run(bg_cmd, check=True, capture_output=True, timeout=30)
 
     return (f"素材生成完成:\n  总时长: {time_offset:.1f}s\n"
             f"  音频: output/narration.mp3\n  字幕: output/subtitles.srt\n"
@@ -270,31 +283,29 @@ def run_generate_assets(script_path: str) -> str:
 
 
 def run_compose_video(output_path: str) -> str:
-    narration = OUTPUT_DIR / "narration.mp3"
-    subtitle = OUTPUT_DIR / "subtitles.srt"
-    background = OUTPUT_DIR / "background.png"
+    narration = _output_path("output/narration.mp3")
+    background = _output_path("output/background.png")
 
     if not narration.exists():
         return "Error: narration.mp3 不存在，请先 generate_assets"
 
-    out = WORKDIR / output_path
+    out = _output_path(output_path)
+    if out.suffix.lower() != '.mp4':
+        return "Error: output must be an MP4 file"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    dur_cmd = f'ffprobe -v error -show_entries format=duration -of csv=p=0 "{narration}"'
-    dur_r = subprocess.run(dur_cmd, shell=True, capture_output=True, text=True)
+    dur_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(narration)]
+    dur_r = subprocess.run(dur_cmd, capture_output=True, text=True, timeout=30)
     try:
         duration = float(dur_r.stdout.strip())
     except ValueError:
         duration = 60
 
-    # Try with subtitles filter first, fallback to no-subtitle version
-    cmd = (
-        f'ffmpeg -y -loop 1 -i "{background}" -i "{narration}" '
-        f'-c:v libx264 -tune stillimage -c:a aac -b:a 192k '
-        f'-pix_fmt yuv420p -shortest -t {duration} "{out}"'
-    )
+    cmd = ['ffmpeg', '-y', '-loop', '1', '-i', str(background), '-i', str(narration),
+           '-c:v', 'libx264', '-tune', 'stillimage', '-c:a', 'aac', '-b:a', '192k',
+           '-pix_fmt', 'yuv420p', '-shortest', '-t', str(duration), str(out)]
     # Note: SRT subtitles saved separately for YouTube upload
-    r = subprocess.run(cmd, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=600)
+    r = subprocess.run(cmd, cwd=WORKDIR, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         return f"Error: ffmpeg 合成失败\n{r.stderr[:500]}"
 
@@ -304,6 +315,20 @@ def run_compose_video(output_path: str) -> str:
 
 def run_upload_youtube(video_path: str, title: str, description: str,
                        tags: list = None, privacy: str = "private") -> str:
+    video_file = _output_path(video_path)
+    if not video_file.is_file() or video_file.suffix.lower() != '.mp4':
+        return "Error: upload requires an existing MP4 in output/"
+    if privacy not in {'private', 'unlisted', 'public'}:
+        return "Error: invalid privacy setting"
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return "Error: upload requires approval at an interactive terminal"
+    print(repr({'video': video_path, 'title': title, 'description': description,
+                'tags': tags or [], 'privacy': privacy}))
+    try:
+        if input('Type PUBLISH to upload this video: ').strip() != 'PUBLISH':
+            return "Upload cancelled"
+    except (EOFError, KeyboardInterrupt):
+        return "Upload cancelled"
     creds_file = WORKDIR / "youtube_credentials.json"
     token_file = WORKDIR / "youtube_token.json"
 
@@ -357,10 +382,6 @@ def run_upload_youtube(video_path: str, title: str, description: str,
                      "tags": tags or [], "categoryId": "22"},
         "status": {"privacyStatus": privacy},
     }
-    video_file = WORKDIR / video_path
-    if not video_file.exists():
-        return f"Error: 视频文件不存在: {video_path}"
-
     media = MediaFileUpload(str(video_file), mimetype="video/mp4", resumable=True)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     response = None
@@ -373,14 +394,16 @@ def run_upload_youtube(video_path: str, title: str, description: str,
 
 def execute_tool(name: str, args: dict) -> str:
     dispatch = {
-        "bash": lambda: run_bash(args["command"]),
         "read_file": lambda: run_read_file(args["path"]),
         "write_file": lambda: run_write_file(args["path"], args["content"]),
         "generate_assets": lambda: run_generate_assets(args["script_path"]),
         "compose_video": lambda: run_compose_video(args["output_path"]),
         "upload_youtube": lambda: run_upload_youtube(**args),
     }
-    return dispatch.get(name, lambda: f"Unknown tool: {name}")()
+    try:
+        return dispatch.get(name, lambda: f"Unknown tool: {name}")()
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
+        return f"Error: {type(exc).__name__}: video tool failed"
 
 
 def agent_loop(messages: list):
