@@ -4,9 +4,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -32,6 +34,12 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["localhost", "127.0.0.1"] + [
+        urlsplit(origin).hostname for origin in CORS_ALLOWED_ORIGINS if urlsplit(origin).hostname
+    ],
+)
+app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
@@ -42,6 +50,16 @@ BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+
+@app.middleware("http")
+async def reject_cross_origin_writes(request: Request, call_next):
+    # CORS alone does not prevent cross-site HTML form submissions to localhost.
+    origin = request.headers.get("origin")
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and origin is not None:
+        if origin not in CORS_ALLOWED_ORIGINS:
+            return JSONResponse(status_code=403, content={"error": "Untrusted request origin."})
+    return await call_next(request)
 
 
 def _split_samples_from_text(text: str) -> List[str]:
@@ -114,8 +132,9 @@ def home(request: Request):
     stats = db.dashboard_stats()
     drafts = db.list_drafts(limit=12)
     return templates.TemplateResponse(
-        "index.html",
-        {
+        request=request,
+        name="index.html",
+        context={
             "request": request,
             "profile": profile,
             "stats": stats,
@@ -204,8 +223,9 @@ def source_detail(source_id: int, request: Request):
     insight = db.get_latest_insight_for_source(source_id)
     drafts = db.list_source_drafts(source_id)
     return templates.TemplateResponse(
-        "source_detail.html",
-        {
+        request=request,
+        name="source_detail.html",
+        context={
             "request": request,
             "source": source,
             "insight": insight,
@@ -220,8 +240,9 @@ def style_page(request: Request):
     profile = db.get_or_create_default_profile()
     samples = db.list_style_samples(profile["id"], limit=120)
     return templates.TemplateResponse(
-        "style.html",
-        {
+        request=request,
+        name="style.html",
+        context={
             "request": request,
             "profile": profile,
             "samples": samples,
@@ -266,8 +287,9 @@ def drafts_page(request: Request):
     if sort == "score":
         drafts.sort(key=lambda d: float(d.get("overall", 0)), reverse=True)
     return templates.TemplateResponse(
-        "drafts.html",
-        {"request": request, "drafts": drafts, "q": q, "sort": sort, "active_nav": "drafts"},
+        request=request,
+        name="drafts.html",
+        context={"request": request, "drafts": drafts, "q": q, "sort": sort, "active_nav": "drafts"},
     )
 
 
@@ -369,6 +391,7 @@ def api_score_latest(source_id: int):
                 "attention": s["attention"],
                 "novelty": s["novelty"],
                 "risk": s["risk"],
+                "engagement": s["engagement"],
                 "overall": s["overall"],
                 "rationale": s["rationale"],
             }
