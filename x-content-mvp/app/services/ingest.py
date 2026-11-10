@@ -6,6 +6,7 @@ import socket
 from pathlib import Path
 from typing import Dict
 from urllib.parse import urlparse
+from urllib.request import getproxies_environment, proxy_bypass_environment
 
 import urllib3
 from bs4 import BeautifulSoup
@@ -55,6 +56,14 @@ def _validated_target(url: str):
     return parsed, port, sorted(resolved)[0]
 
 
+def _env_proxy(parsed):
+    """Return the environment proxy URL for this target, or None (honours NO_PROXY)."""
+    proxies = getproxies_environment()
+    if proxy_bypass_environment(parsed.hostname or '', proxies):
+        return None
+    return proxies.get(parsed.scheme.lower()) or proxies.get('all') or None
+
+
 def validate_public_http_url(url: str) -> str:
     return _validated_target(url)[0].geturl()
 
@@ -62,20 +71,29 @@ def validate_public_http_url(url: str) -> str:
 def extract_web_content(url: str, timeout_seconds: int = 15) -> Dict[str, str]:
     parsed, port, address = _validated_target(url)
     options = {'timeout': urllib3.Timeout(total=timeout_seconds), 'maxsize': 1}
-    # Connect to the checked IP, without a second DNS lookup or environment proxy.
-    # HTTPS still verifies the certificate and sends SNI for the original host.
-    if parsed.scheme.lower() == 'https':
-        pool = urllib3.HTTPSConnectionPool(address, port, server_hostname=parsed.hostname,
-                                         assert_hostname=parsed.hostname, **options)
-    else:
-        pool = urllib3.HTTPConnectionPool(address, port, **options)
+    proxy_url = _env_proxy(parsed)
+    pool = None
     response = None
     try:
-        target = parsed.path or '/'
-        if parsed.query:
-            target += '?' + parsed.query
-        response = pool.urlopen('GET', target, headers={'Host': parsed.netloc, 'User-Agent': 'ContentCreatorHub/1.0'},
-                                redirect=False, retries=False, preload_content=False)
+        if proxy_url:
+            # Proxy mode: the host was already checked locally; the proxy does its own DNS.
+            # Redirects are not followed, so every non-2xx hop is rejected below.
+            pool = urllib3.ProxyManager(proxy_url, **options)
+            response = pool.urlopen('GET', parsed.geturl(), headers={'User-Agent': 'ContentCreatorHub/1.0'},
+                                    redirect=False, retries=False, preload_content=False)
+        else:
+            # Connect to the checked IP, without a second DNS lookup or environment proxy.
+            # HTTPS still verifies the certificate and sends SNI for the original host.
+            if parsed.scheme.lower() == 'https':
+                pool = urllib3.HTTPSConnectionPool(address, port, server_hostname=parsed.hostname,
+                                                 assert_hostname=parsed.hostname, **options)
+            else:
+                pool = urllib3.HTTPConnectionPool(address, port, **options)
+            target = parsed.path or '/'
+            if parsed.query:
+                target += '?' + parsed.query
+            response = pool.urlopen('GET', target, headers={'Host': parsed.netloc, 'User-Agent': 'ContentCreatorHub/1.0'},
+                                    redirect=False, retries=False, preload_content=False)
         if not 200 <= response.status < 300:
             raise ValueError('URL returned an error or redirect')
         body = response.read(MAX_PAGE_BYTES + 1, decode_content=True)
@@ -84,7 +102,8 @@ def extract_web_content(url: str, timeout_seconds: int = 15) -> Dict[str, str]:
     finally:
         if response is not None:
             response.close()
-        pool.close()
+        if pool is not None:
+            pool.close()
     soup = BeautifulSoup(body, "html.parser")
 
     for tag in soup(["script", "style", "noscript", "svg", "footer", "nav"]):

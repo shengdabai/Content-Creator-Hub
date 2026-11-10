@@ -22,6 +22,8 @@ class WebSecurityTests(unittest.TestCase):
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
         stack.enter_context(patch.object(db, 'DATA_DIR', directory))
         stack.enter_context(patch.object(db, 'DB_PATH', directory / 'test.db'))
+        # Keep the developer's proxy settings out of the pinned-IP tests.
+        stack.enter_context(patch.dict('os.environ', {}, clear=True))
 
     def test_cross_site_forms_and_api_writes_are_rejected(self):
         with TestClient(app, base_url='http://localhost:8000') as client:
@@ -74,6 +76,59 @@ class WebSecurityTests(unittest.TestCase):
                     ingest.extract_web_content('http://example.com')
             response.close.assert_called_once()
             pool.close.assert_called_once()
+
+    def _proxy_env(self, **extra):
+        return patch.dict('os.environ', extra, clear=True)
+
+    def _ok_response(self):
+        response = Mock(status=200)
+        response.read.return_value = b'<html><title>T</title><p>Body</p></html>'
+        return response
+
+    def test_proxy_env_routes_public_host_through_proxy(self):
+        manager = Mock()
+        manager.urlopen.return_value = self._ok_response()
+        with self._proxy_env(HTTPS_PROXY='http://127.0.0.1:7897'), \
+                patch.object(ingest, '_validated_target', return_value=(ingest.urlparse('https://example.com/a?q=1'), 443, '8.8.8.8')), \
+                patch.object(ingest.urllib3, 'ProxyManager', return_value=manager) as proxy_cls, \
+                patch.object(ingest.urllib3, 'HTTPSConnectionPool') as pinned:
+            self.assertEqual(ingest.extract_web_content('https://example.com/a?q=1')['title'], 'T')
+        self.assertEqual(proxy_cls.call_args.args, ('http://127.0.0.1:7897',))
+        self.assertEqual(manager.urlopen.call_args.args, ('GET', 'https://example.com/a?q=1'))
+        self.assertFalse(manager.urlopen.call_args.kwargs['redirect'])
+        pinned.assert_not_called()
+        manager.close.assert_called_once()
+
+    def test_no_proxy_excludes_host_and_keeps_pinned_path(self):
+        pool = Mock()
+        pool.urlopen.return_value = self._ok_response()
+        with self._proxy_env(HTTPS_PROXY='http://127.0.0.1:7897', NO_PROXY='example.com'), \
+                patch.object(ingest, '_validated_target', return_value=(ingest.urlparse('https://example.com'), 443, '8.8.8.8')), \
+                patch.object(ingest.urllib3, 'ProxyManager') as proxy_cls, \
+                patch.object(ingest.urllib3, 'HTTPSConnectionPool', return_value=pool) as pinned:
+            ingest.extract_web_content('https://example.com')
+        proxy_cls.assert_not_called()
+        self.assertEqual(pinned.call_args.args, ('8.8.8.8', 443))
+
+    def test_without_proxy_uses_pinned_ip(self):
+        pool = Mock()
+        pool.urlopen.return_value = self._ok_response()
+        with self._proxy_env(), \
+                patch.object(ingest, '_validated_target', return_value=(ingest.urlparse('http://example.com'), 80, '8.8.8.8')), \
+                patch.object(ingest.urllib3, 'ProxyManager') as proxy_cls, \
+                patch.object(ingest.urllib3, 'HTTPConnectionPool', return_value=pool) as pinned:
+            ingest.extract_web_content('http://example.com')
+        proxy_cls.assert_not_called()
+        self.assertEqual(pinned.call_args.args, ('8.8.8.8', 80))
+
+    def test_proxy_mode_still_rejects_private_resolution_before_any_request(self):
+        for address in ('127.0.0.1', '10.1.2.3'):
+            with self.subTest(address=address), self._proxy_env(HTTP_PROXY='http://127.0.0.1:7897'), \
+                    patch.object(ingest.socket, 'getaddrinfo', return_value=[(2, 1, 6, '', (address, 0))]), \
+                    patch.object(ingest.urllib3, 'ProxyManager') as proxy_cls:
+                with self.assertRaises(ValueError):
+                    ingest.extract_web_content('http://example.com')
+                proxy_cls.assert_not_called()
 
     def test_rescoring_preserves_engagement(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(db, 'DATA_DIR', Path(directory)), patch.object(db, 'DB_PATH', Path(directory) / 'test.db'):
